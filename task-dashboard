@@ -25,16 +25,18 @@ tmux session. If the hook gets triggered the views will be updated.
 use Cwd qw(abs_path);
 use File::Basename;
 use Getopt::Long;
-use JSON::PP qw(decode_json);
+use JSON::PP qw(decode_json encode_json);
 
 
 my %DEFAULT = (
-	CONFIG_NAME => 'dashboard.json',
+    CONFIG_NAME => 'dashboard.json',
+    
+    TMUX_SESSION_NAME => 'task-dashboard',
+    TMUX_WINDOW_NAME  => 'view',
+    TMUX_WIDTH  => 273,
+    TMUX_HEIGHT => 74,
 
-	TMUX_SESSION_NAME => 'task-dashboard',
-	TMUX_WINDOW_NAME  => 'view',
-	TMUX_WIDTH  => 273,
-	TMUX_HEIGHT => 74,
+    SAVE_PANE_IDS => 'dashboard.save-pids',
 );
 
 # Taken from the 'Write Commands' list
@@ -47,7 +49,7 @@ my @WRITE_COMMANDS = qw(
 ); # Also accept 'context' since views probably depend on current context
 
 # Minimal interactive bash as a hack to keep panes open
-my $MINIMAL_BASH = 'bash --rcfile <(echo "unset MAIL PS1")';
+my $MINIMAL_BASH = "'bash --rcfile <(echo \"unset MAIL PS1\")'";
 
 
 my $config = get_config();
@@ -65,14 +67,14 @@ if (@ARGV == 6) {
 	# Exit if the dashboard is not running, yet
 	dashboard_is_running($session) or exit 0;
 
-	my @pane_commands = parse($config->{layout}, 0, []);
-	for my $idx (0 .. $#pane_commands) {
-		my $command = $pane_commands[$idx];
+	my $pane_commands = get_saved_pane_commands();
+	foreach my $pid (keys %{$pane_commands}){
+		my $command = $pane_commands->{$pid};
 		$command =~ s/^\*//;
 		# Do not execute again if `!`-marker is present
 		next if $command =~ /^!/;
 		$command = sanitize($command);
-		tmux('send-keys', '-t', "$session:$window.$idx", "clear; $command", 'Enter');
+		tmux('send-keys', '-t', "$session:$window.$pid", "clear; $command", 'Enter');
 	}
 
 # Called from terminal
@@ -91,7 +93,7 @@ if (@ARGV == 6) {
 	ensure_hook_link();
 
 	# Setup layout
-	tmux('new', '-s', $session, '-n', $window, '-d', '-x', $width, '-y', $height, $MINIMAL_BASH);
+	my $main_pane_id = tmux_id('new', '-s', $session, '-n', $window, '-d',  '-x', $width, '-y', $height, $MINIMAL_BASH);
 	# Keep status position
 	tmux('set', '-t', "$session:$window", 'status', "on");
 	# Make it on top
@@ -108,20 +110,18 @@ if (@ARGV == 6) {
 	    tmux('source-file', $tmuxrc);
 	}
 
-	my @pane_commands = parse($config->{layout}, 0, \my @split_options);;
+	my %pane_commands = parse($config->{layout}, $main_pane_id);;
 
-	tmux('split-window', @{$_}, $MINIMAL_BASH) for @split_options;
-
-	# Executing commands initially
-	for my $idx (0 .. $#pane_commands) {
-		my $command = $pane_commands[$idx];
+	# Executing commands in corresponding pane id
+	foreach my $pid (keys %pane_commands){
+		my $command = $pane_commands{$pid};
 		# Select pane if `*`-marker is present
-		tmux('select-pane', '-t', "$session:$window.$idx") if $command =~ s/^\*//;
+		tmux('select-pane', '-t', "$session:$window.$pid") if $command =~ s/^\*//;
 		$command =~ s/^!//;
 		$command = sanitize($command);
-		tmux('send-keys', '-t', "$session:$window.$idx", "clear; $command", 'Enter');
+		tmux('send-keys', '-t', "$session:$window.$pid", "clear; $command", 'Enter');
 	}
-
+	save_pane_commands(\%pane_commands);
 	tmux('attach', '-t', $session) if $config->{'auto-attach'};
 }
 
@@ -137,6 +137,26 @@ sub get_config {
 	close $fh or warn $!;
 
 	return $config;
+}
+
+sub get_saved_pane_commands{
+    my $filepath = task_config('rc.data.location').'/'.$DEFAULT{SAVE_PANE_IDS};
+    die "Cannot find dashboard pane ids config!\n" unless -f $filepath;
+    open my $fh, '<', $filepath or die $!;
+    local $/;
+    my $pane_ids = decode_json(<$fh>);
+    close $fh or warn $!;
+    
+    return $pane_ids;
+}
+    
+sub save_pane_commands{
+    my $pane_ids = shift;
+    my $filepath = task_config('rc.data.location').'/'.$DEFAULT{SAVE_PANE_IDS};
+    open(my $fh, '>:encoding(UTF-8)', $filepath) or die $!;
+    my $encoded=encode_json($pane_ids);
+    print $fh $encoded;
+    close $fh;
 }
 
 sub get_config_file {
@@ -159,43 +179,43 @@ sub get_task_context {
 }
 
 sub parse {
-	my $layer = shift;
-	my $pivot_id = shift;
-	my $s_opts = shift;
+    
+    my $layer = shift;
+    my $pivot_id = shift;
+    
+    my ($layout, $contents) = each %{$layer};
+    my ($split, @parts) = split /:/, $layout;
+    my ($pivot) = grep { $parts[$_] eq '~' } 0 .. $#parts;
+    my @pane_ids = ();
+    my %ret = ();
+    die if @parts != @{$contents};
+    
+    
+    # TODO Move $session and $window variable into this subroutine instead of
+    #      using their global scope
+    for my $idx (0 .. $pivot-1) {
+	$pane_ids[$idx]=tmux_id('split-window', '-t', "$session:$window.$pivot_id", "-$split", "-$parts[$idx]", '-b', $MINIMAL_BASH);
+    }
+    $pane_ids[$pivot] = $pivot_id;
+    for my $idx (reverse $pivot+1 .. $#parts) {
+	$pane_ids[$idx]=tmux_id('split-window', '-t', "$session:$window.$pivot_id", "-$split", "-$parts[$idx]", $MINIMAL_BASH);
+    }
 
-	my ($layout, $contents) = each %{$layer};
-	my ($split, @parts) = split /:/, $layout;
-	my ($pivot) = grep { $parts[$_] eq '~' } 0 .. $#parts;
+    my @commands = @{$contents};
 
-	die if @parts != @{$contents};
-
-	# ID offset is consequently number of created panes
-	my $id_offset = @{$s_opts};
-
-	# TODO Move $session and $window variable into this subroutine instead of
-	#      using their global scope
-	for my $idx (0 .. $pivot-1) {
-		push @{$s_opts}, [ '-t', "$session:$window.$pivot_id", "-$split", "-$parts[$idx]", '-b' ];
+    # Expand commands recursively
+    for my $idx (0 .. $#commands) {
+	my $command = $commands[$idx];
+	if (ref $command eq 'HASH') {
+	    my %sub_ret= parse($command, $pane_ids[$idx]);
+	    %ret = (%ret, %sub_ret)
 	}
-	for my $idx (reverse $pivot+1 .. $#parts) {
-		push @{$s_opts}, [ '-t', "$session:$window.$pivot_id", "-$split", "-$parts[$idx]" ];
+	else{
+	    $ret{$pane_ids[$idx]}=$command
 	}
+    }
 
-	my @indeces = ( $pivot, 0 .. $pivot-1, reverse $pivot+1 .. $#parts );
-	my @commands = @{$contents}[@indeces];
-
-	# Expand commands recursively
-	for my $idx (0 .. $#commands) {
-		my $command = $commands[$idx];
-		if (ref $command eq 'HASH') {
-			my $p_id = $idx + $id_offset; # Index + the count of split-window w/o this round
-			# First element is command of pivot pane
-			($commands[$idx], my @sub_cmds) = parse($command, $p_id, $s_opts);
-			push @commands, @sub_cmds;
-		}
-	}
-
-	return @commands;
+    return %ret;
 }
 
 sub dashboard_is_running {
@@ -223,6 +243,14 @@ sub tmux {
 	system 'tmux', @_;
 }
 
+sub tmux_id {
+    my $tmux_cmd = shift;
+    my $cmdline = "tmux" . " " . $tmux_cmd . ' -P -F "#{pane_id}" ' . join(" ", @_);
+    my $ret = `$cmdline`;
+    $ret =~ /^(%[0-9]+)$/;
+    return $1;
+}
+	
 sub sanitize {
 	my $command = shift;
 
