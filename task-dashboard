@@ -51,6 +51,7 @@ my $MINIMAL_BASH = 'bash --rcfile <(echo "unset MAIL PS1")';
 
 
 my $config = get_config();
+
 my $session = $config->{session} || $DEFAULT{TMUX_SESSION_NAME};
 my $window  = $config->{window}  || $DEFAULT{TMUX_WINDOW_NAME};
 
@@ -83,8 +84,6 @@ if (@ARGV == 6) {
 		exit 0;
 	}
 
-	my @pane_commands = parse($config->{layout}, 0, \my @split_options);;
-
 	my $width  = $config->{width}  || $DEFAULT{TMUX_WIDTH};
 	my $height = $config->{height} || $DEFAULT{TMUX_HEIGHT};
 
@@ -93,7 +92,24 @@ if (@ARGV == 6) {
 
 	# Setup layout
 	tmux('new', '-s', $session, '-n', $window, '-d', '-x', $width, '-y', $height, $MINIMAL_BASH);
-	tmux('set', '-t', "$session:$window", 'status', "off");
+	# Keep status position
+	tmux('set', '-t', "$session:$window", 'status', "on");
+	# Make it on top
+	tmux('set', '-t', "$session", 'status-position', 'top');
+	# source config file for tmux if needed
+	if (exists($config->{tmuxrc})){
+	    my $tmuxrc="";
+	    if(substr( $config->{tmuxrc}, 0, 1 ) eq '/') {
+		$tmuxrc = $config->{tmuxrc};
+	    }
+	    else{
+		$tmuxrc = task_config('rc.data.location').'/'.$config->{tmuxrc};
+	    }
+	    tmux('source-file', $tmuxrc);
+	}
+
+	my @pane_commands = parse($config->{layout}, 0, \my @split_options);;
+
 	tmux('split-window', @{$_}, $MINIMAL_BASH) for @split_options;
 
 	# Executing commands initially
